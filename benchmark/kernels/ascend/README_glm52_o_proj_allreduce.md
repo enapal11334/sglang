@@ -49,8 +49,42 @@ HCCL buffer 和 task queue 采用提供的 decode 启动配置；若所比较服
 采集器启动后执行 3 次准备迭代，再执行一次设备同步、跨 rank barrier 和设备同步，
 然后才开始正式计时。该阶段在 Timeline 中标记为 `benchmark_setup`，包含准备
 计算和通信，分析时请排除；正式迭代仍为指定的 50 次。
-每轮不额外添加 barrier，不会把实际通信等待人为搬到另一项同步中。
+默认每轮不额外添加 barrier 或前置通信。
 这些措施降低初始化和调度扰动，不能保证所有 rank 同时到达或消除全部等待。
+
+## 前置独立通信 A/B 实验
+
+`--pre-allreduce-elements N` 在每轮 o_proj 前增加一次独立的 BF16 HCCL
+AllReduce SUM，默认 `0` 关闭。buffer 在初始化时分配，内容始终为零，
+不参与投影结果。通信使用同一 TP 组，调用 `work.wait()` 建立到当前计算
+stream 的依赖，再提交 o_proj；不增加逐轮设备同步。Graph 模式将前置通信
+及其等待依赖一起捕获，每次 replay 都执行，外部 `--impl` 入口也适用。
+所有 rank 必须使用一致配置。此路径仍需在目标 torch_npu/CANN 版本验证。
+
+在上述环境配置完成后运行基线、1 元素及与目标通信等大的三个配置：
+
+```bash
+for elements in 0 1 98304; do
+  python -m torch.distributed.run \
+    --standalone --nnodes=1 --nproc-per-node=16 \
+    benchmark/kernels/ascend/bench_glm52_o_proj_allreduce.py \
+    --tp-size 16 --tokens 16 \
+    --hidden-size 6144 --num-heads 64 --v-head-dim 256 \
+    --quant static --weight-format nz --graph \
+    --warmup 20 --iterations 50 \
+    --pre-allreduce-elements "$elements" \
+    --profile-dir "profiles/glm52_pre_ar_${elements}" \
+    --output-dir "results/glm52_pre_ar_${elements}"
+done
+```
+
+先比较 Timeline 中每轮第二个 AllReduce（目标通信）的耗时及各 rank
+MatMul 结束时间差；第一个是前置通信，勿混合统计。排除 benchmark_setup。
+再比较 JSON 的 `max_rank_us_per_iteration`，它包含前置通信、投影及目标通信，
+并记录 `pre_allreduce_elements`、`pre_allreduce_bytes` 和等待方式。
+目标通信变短而整体不变/变慢表示等待迁移。总耗时对比应另跑不带
+`--profile-dir` 的相同配置，并使用独立 output-dir，重复几轮确认波动。
+也可去掉 `--graph` 对照 eager；图捕获成功并不代替 Timeline 中的依赖验证。
 
 ## 查看与核对
 

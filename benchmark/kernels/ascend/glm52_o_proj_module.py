@@ -6,7 +6,7 @@ import torch
 class OProjAllReduce(torch.nn.Module):
     """持有投影参数和 HCCL 通信组，forward 返回完整 TP 归约结果。"""
 
-    def __init__(self, params, process_group, implementation):
+    def __init__(self, params, process_group, implementation, pre_allreduce_elements=0):
         """注册量化参数为 buffer，避免训练参数和外部参数包参与调用。
 
         输入：params 为数据构造函数返回的 SimpleNamespace，含 quant(str)、
@@ -21,6 +21,13 @@ class OProjAllReduce(torch.nn.Module):
         self.quant = params.quant
         self.process_group = process_group
         self.implementation = implementation
+        # A separate persistent payload: SUM of zeros stays zero across replays.
+        # Allocate outside warmup/capture/timing; never touch projection inputs.
+        self.register_buffer(
+            "pre_allreduce_buffer",
+            torch.zeros(pre_allreduce_elements, dtype=torch.bfloat16,
+                        device=params.weight.device) if pre_allreduce_elements else None,
+        )
         for name in (
             "weight", "weight_scale", "input_scale_reciprocal",
             "input_offset", "deq_scale", "quant_bias",
@@ -34,4 +41,14 @@ class OProjAllReduce(torch.nn.Module):
         输出：当前 NPU 上的 BF16 [M,N]，各 rank 均持有完整归约结果。
         副作用：组内所有 rank 必须按相同顺序调用通信。
         """
+        if self.pre_allreduce_buffer is not None:
+            import torch.distributed as dist
+
+            # Establish a communication -> current compute stream dependency.
+            # Keep this inside forward so NPUGraph captures it on every replay.
+            work = dist.all_reduce(
+                self.pre_allreduce_buffer, op=dist.ReduceOp.SUM,
+                group=self.process_group, async_op=True,
+            )
+            work.wait()
         return self.implementation(x, self, self.process_group)

@@ -45,6 +45,8 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--iterations", type=int, default=100)
     p.add_argument("--graph", action="store_true")
+    p.add_argument("--pre-allreduce-elements", type=int, default=0,
+                   help="BF16 elements in an independent all-reduce before each o_proj; 0 disables it")
     p.add_argument("--no-cpu-affinity", action="store_true", help="Keep externally configured CPU affinity")
     p.add_argument("--profile-dir", help="torch_npu profiler output, one dir per rank")
     p.add_argument("--output-dir", default="o_proj_results")
@@ -53,6 +55,8 @@ def parse_args():
     p.add_argument("--impl", help="module:function implementing fn(x, params, process_group)")
     p.add_argument("--describe", action="store_true", help="Print shapes without NPU imports")
     args = p.parse_args()
+    if args.pre_allreduce_elements < 0:
+        p.error("pre-allreduce-elements must be nonnegative")
     if min(args.tp_size, args.tokens, args.hidden_size, args.num_heads,
            args.v_head_dim, args.warmup, args.iterations) < 1:
         p.error("sizes and iteration counts must be positive")
@@ -348,7 +352,9 @@ def build_module(args, params, process_group):
     """
     from glm52_o_proj_module import OProjAllReduce
 
-    module = OProjAllReduce(params, process_group, load_implementation(args.impl)).eval()
+    module = OProjAllReduce(
+        params, process_group, load_implementation(args.impl),
+        pre_allreduce_elements=args.pre_allreduce_elements).eval()
     check_weight_format(module.weight, args.weight_format)
     return module
 
@@ -467,6 +473,9 @@ def save_results(args, runtime, x, w_cpu, params, candidate, elapsed):
                   collective="all-reduce", quant_bias=args.quant_bias,
                   output_shape=list(candidate.shape), quant="W8A8" if args.quant == "static" else "W8A8_DYNAMIC",
                   graph=args.graph, impl=args.impl or "o_proj_allreduce",
+                  pre_allreduce_elements=args.pre_allreduce_elements,
+                  pre_allreduce_bytes=args.pre_allreduce_elements * 2,
+                  pre_allreduce_wait="work.wait" if args.pre_allreduce_elements else None,
                   compiled=False, weight_actual_npu_format=actual_format,
                   cpu_affinity=runtime.cpu_affinity,
                   cpu_affinity_enabled=not args.no_cpu_affinity,
@@ -536,6 +545,8 @@ if __name__ == "__main__":
                               weight=[args.hidden_size, args.num_heads * args.v_head_dim // args.tp_size],
                               matmul_output=[args.tokens, args.hidden_size],
                               output=[args.tokens, args.hidden_size], collective="all-reduce",
-                              tp_size=args.tp_size), indent=2))
+                              tp_size=args.tp_size,
+                              pre_allreduce_elements=args.pre_allreduce_elements,
+                              pre_allreduce_bytes=args.pre_allreduce_elements * 2), indent=2))
     else:
         run(args)
